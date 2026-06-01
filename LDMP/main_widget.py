@@ -1262,11 +1262,10 @@ class MainWidget(QtWidgets.QDockWidget, DockWidgetTrendsEarthUi):
         # Pre-authenticate on main thread to avoid accessing authManager from background thread
         # QgsApplication.authManager() is not thread-safe and causes segfaults from worker threads
         try:
-            from . import api
-
-            if api.API._instance is not None:
-                # Trigger login on main thread to cache tokens before background work
-                api.API._instance.login()
+            # Trigger login on the shared job manager client from the main
+            # thread so background refresh can reuse cached credentials/tokens
+            # without touching QgsApplication.authManager().
+            job_manager.api_client.login()
         except Exception as e:
             log(
                 f"Failed to pre-authenticate before remote refresh: {e}",
