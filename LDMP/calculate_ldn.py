@@ -162,6 +162,106 @@ def check_subnational_rasters_consistent(unit_rasters) -> str | None:
     return "\n".join(f"• {p}" for p in problems) or None
 
 
+def write_cutline_geojson(geometry: QgsGeometry) -> str:
+    """Write a WGS84 geometry to a temporary GeoJSON file usable as a cutline."""
+    path = GetTempFilename(".geojson")
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {},
+                        "geometry": json.loads(geometry.asJson()),
+                    }
+                ],
+            },
+            f,
+        )
+    return path
+
+
+def mask_raster_to_cutline(path: str, cutline_path: str) -> str | None:
+    """
+    Return a VRT of ``path`` with every pixel whose centre falls outside the
+    cutline set to nodata, on exactly the same grid as the source (no
+    resampling). Returns None if the raster cannot be opened or warped.
+    """
+    try:
+        src = gdal.Open(path)
+    except RuntimeError:
+        return None
+    if src is None:
+        return None
+
+    origin_x, pixel_width, _, origin_y, _, pixel_height = src.GetGeoTransform()
+    nodata_values = []
+    for n in range(1, src.RasterCount + 1):
+        nodata = src.GetRasterBand(n).GetNoDataValue()
+        nodata_values.append(ld_config.NODATA_VALUE if nodata is None else nodata)
+
+    out_path = GetTempFilename(".vrt")
+    try:
+        ds = gdal.Warp(
+            out_path,
+            src,
+            options=gdal.WarpOptions(
+                format="VRT",
+                outputBounds=(
+                    origin_x,
+                    origin_y + pixel_height * src.RasterYSize,
+                    origin_x + pixel_width * src.RasterXSize,
+                    origin_y,
+                ),
+                xRes=pixel_width,
+                yRes=abs(pixel_height),
+                resampleAlg="near",
+                cutlineDSName=cutline_path,
+                cropToCutline=False,
+                dstNodata=" ".join(str(v) for v in nodata_values),
+            ),
+        )
+    except RuntimeError:
+        ds = None
+    src = None
+    if ds is None:
+        return None
+    ds.FlushCache()
+    ds = None
+    return out_path
+
+
+def build_subnational_mosaic(vrt_path: str, unit_rasters) -> str | None:
+    """
+    Mosaic per-unit rasters into ``vrt_path``, each masked to its own unit
+    polygon first.
+
+    Unit results are exported for the unit's bounding box, so neighbouring
+    units overlap. Masking to the polygon means every pixel comes from the
+    unit it belongs to, instead of from whichever raster BuildVRT lists last.
+
+    ``unit_rasters`` is a list of ``(unit_name, path, cutline_path)``.
+    Returns None on success, otherwise the name of the unit that failed.
+    """
+    masked_paths = []
+    for unit_name, path, cutline_path in unit_rasters:
+        masked_path = mask_raster_to_cutline(path, cutline_path)
+        if masked_path is None:
+            return unit_name
+        masked_paths.append(masked_path)
+
+    try:
+        ds = gdal.BuildVRT(vrt_path, masked_paths)
+    except RuntimeError:
+        ds = None
+    if ds is None:
+        return ", ".join(name for name, _, _ in unit_rasters)
+    ds.FlushCache()
+    ds = None
+    return None
+
+
 @dataclass
 class TimePeriodWidgets:
     radio_time_period_same: QtWidgets.QRadioButton
@@ -3518,11 +3618,18 @@ class DlgCalculateLDNSummaryTableAdmin(
             except RuntimeError as e:
                 return None, None, str(e)
 
-        # Union all unit geometries into one AOI
+        # Union all unit geometries into one AOI, and keep each unit's own
+        # geometry as a cutline to mask its result before mosaicking
         unit_geometries = []
-        for ua in unit_aois:
-            for f in ua.get_layer_wgs84().getFeatures():
-                unit_geometries.append(f.geometry())
+        unit_cutlines = {}
+        for unit, ua in zip(units, unit_aois):
+            geometries = [f.geometry() for f in ua.get_layer_wgs84().getFeatures()]
+            if not geometries:
+                continue
+            unit_geometries.extend(geometries)
+            unit_cutlines[unit.get("id")] = write_cutline_geojson(
+                QgsGeometry.unaryUnion(geometries)
+            )
 
         if not unit_geometries:
             return None, None, self.tr("No valid unit geometries found.")
@@ -3577,10 +3684,8 @@ class DlgCalculateLDNSummaryTableAdmin(
             period_name = period.get("name", "")
             period_params = dict(period.get("params", period))
 
-            # Gather rasters per path key across all units
-            per_key_paths: dict[str, list[str]] = {}
-
             missing_units = []
+            unit_mosaic_inputs = []
             unit_rasters = []
             for unit in units:
                 unit_name = unit.get("name", "")
@@ -3600,7 +3705,9 @@ class DlgCalculateLDNSummaryTableAdmin(
                 # Collect main VRT/TIF path for this unit result
                 result_path = str(raster_result.uri.uri) if raster_result.uri else None
                 if result_path:
-                    per_key_paths.setdefault("_main_uri", []).append(result_path)
+                    unit_mosaic_inputs.append(
+                        (unit_name, result_path, unit_cutlines.get(unit.get("id")))
+                    )
                     unit_rasters.append(
                         (
                             unit_name,
@@ -3635,21 +3742,19 @@ class DlgCalculateLDNSummaryTableAdmin(
                     ).format(period_name, mismatch),
                 )
 
-            # Build a mosaic VRT from all unit main URIs for this period
-            main_uris = per_key_paths.get("_main_uri", [])
-            if main_uris:
+            # Build a mosaic VRT from all unit results for this period, each
+            # masked to its own unit polygon
+            if unit_mosaic_inputs:
                 vrt_path = GetTempFilename(".vrt")
-                ds = gdal.BuildVRT(vrt_path, main_uris)
-                if ds is None:
+                failed_unit = build_subnational_mosaic(vrt_path, unit_mosaic_inputs)
+                if failed_unit:
                     return (
                         None,
                         None,
-                        self.tr("Failed to build mosaic VRT for period '{}'.").format(
-                            period_name
-                        ),
+                        self.tr(
+                            "Failed to build mosaic VRT for period '{}' (unit: {})."
+                        ).format(period_name, failed_unit),
                     )
-                ds.FlushCache()
-                ds = None
 
                 # Patch the primary raster path keys to point to the VRT.
                 for key in RASTER_PATH_KEYS:
