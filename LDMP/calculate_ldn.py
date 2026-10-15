@@ -35,7 +35,7 @@ from .calculate import DlgCalculateBase
 from .jobs.manager import job_manager
 from .localexecution import ldn
 from .logger import log
-from .utils import push_message
+from .utils import geojsons_envelope, push_message
 
 # SOC baseline year - the SOC reference dataset is from 2000, so analysis cannot start earlier
 SOC_MIN_YEAR = 2000
@@ -73,7 +73,35 @@ def subnational_period_key(period_name: str) -> str:
     return period_name
 
 
-def job_matches_subnational_unit(job, unit: dict, period_name=None) -> bool:
+def job_is_stale_for_subnational_unit(job, unit: dict, unit_bbox=None) -> bool:
+    """
+    Return True if a sub-indicator job was run for a different geometry than
+    the unit currently has.
+    """
+    params = job.params or {}
+    tag = params.get("subnational_unit")
+
+    job_hash = tag.get("geometry_hash") if isinstance(tag, dict) else None
+    unit_hash = unit.get("geometry_hash")
+    if job_hash and unit_hash:
+        return job_hash != unit_hash
+
+    if unit_bbox is None:
+        return False
+    job_env = geojsons_envelope(params.get("geojsons"))
+    unit_env = geojsons_envelope(unit_bbox)
+    if job_env is None or unit_env is None:
+        return False
+    return not all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(job_env, unit_env))
+
+
+def job_matches_subnational_unit(
+    job,
+    unit: dict,
+    period_name=None,
+    include_stale: bool = False,
+    unit_bbox=None,
+) -> bool:
     """
     Return True if a sub-indicator job was run for the given subnational unit
     and, when ``period_name`` is given, for that period.
@@ -90,6 +118,9 @@ def job_matches_subnational_unit(job, unit: dict, period_name=None) -> bool:
         head, sep, job_period = task_name.rpartition(" - ")
         if not sep or head != unit.get("name", ""):
             return False
+
+    if not include_stale and job_is_stale_for_subnational_unit(job, unit, unit_bbox):
+        return False
 
     if period_name is None:
         return True
@@ -2909,6 +2940,7 @@ class DlgCalculateOneStep(DlgCalculateBase, DlgCalculateOneStepUi):
                 unit_payload["subnational_unit"] = {
                     "id": unit.get("id"),
                     "name": unit_name,
+                    "geometry_hash": unit.get("geometry_hash"),
                 }
 
                 if unit_matrix_widget is not None:
@@ -3622,7 +3654,10 @@ class DlgCalculateLDNSummaryTableAdmin(
         # geometry as a cutline to mask its result before mosaicking
         unit_geometries = []
         unit_cutlines = {}
+        unit_bboxes = {}
         for unit, ua in zip(units, unit_aois):
+            bbox = ua.bounding_box_gee_geojson()
+            unit_bboxes[unit.get("id")] = bbox[1] if bbox else None
             geometries = [f.geometry() for f in ua.get_layer_wgs84().getFeatures()]
             if not geometries:
                 continue
@@ -3664,7 +3699,9 @@ class DlgCalculateLDNSummaryTableAdmin(
             return [
                 job
                 for job in completed_jobs
-                if job_matches_subnational_unit(job, unit, period_name)
+                if job_matches_subnational_unit(
+                    job, unit, period_name, unit_bbox=unit_bboxes.get(unit.get("id"))
+                )
             ]
 
         # For each period, build mosaic VRTs for every raster layer
@@ -3685,6 +3722,7 @@ class DlgCalculateLDNSummaryTableAdmin(
             period_params = dict(period.get("params", period))
 
             missing_units = []
+            stale_units = []
             unit_mosaic_inputs = []
             unit_rasters = []
             for unit in units:
@@ -3692,7 +3730,18 @@ class DlgCalculateLDNSummaryTableAdmin(
                 unit_jobs = _jobs_for_unit_period(unit, period_name)
 
                 if not unit_jobs:
-                    missing_units.append(unit_name)
+                    if any(
+                        job_matches_subnational_unit(
+                            job,
+                            unit,
+                            period_name,
+                            include_stale=True,
+                        )
+                        for job in completed_jobs
+                    ):
+                        stale_units.append(unit_name)
+                    else:
+                        missing_units.append(unit_name)
                     continue
 
                 # Use the most recent completed job for this unit
@@ -3715,6 +3764,18 @@ class DlgCalculateLDNSummaryTableAdmin(
                             [band.name for band in raster_result.get_bands()],
                         )
                     )
+
+            if stale_units:
+                return (
+                    None,
+                    None,
+                    self.tr(
+                        "The boundary of the following subnational units was "
+                        "changed after their {} sub-indicator result was "
+                        "calculated: {}.\n\n"
+                        "Re-run the sub-indicator calculation for these units."
+                    ).format(period_name, ", ".join(stale_units)),
+                )
 
             if missing_units:
                 return (
