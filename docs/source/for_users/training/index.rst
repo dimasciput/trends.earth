@@ -8,6 +8,7 @@ Training Manual
    :caption: Training Manual
 
    Settings <settings>
+   SDG 15.3.1 for subnational units <sdg1531_subnational_units>
    Land Degradation <landdegradation>
    Drought <drought>
    UNCCD Reporting <unccdreporting>
